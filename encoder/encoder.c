@@ -950,7 +950,14 @@ static int x264_validate_parameters( x264_t *h, int b_open )
     if( h->param.b_bluray_compat )
     {
         h->param.i_bframe_pyramid = X264_MIN( X264_B_PYRAMID_STRICT, h->param.i_bframe_pyramid );
-        h->param.i_bframe = X264_MIN( h->param.i_bframe, 3 );
+        h->param.i_bframe = x264_clip3( h->param.i_bframe, 0, 3 );
+        if( b_open && h->param.b_open_gop && h->param.i_keyint_max < X264_KEYINT_MAX_INFINITE )
+        {
+            /* Bluray limits GOP size in stream order so keyint or bframes should be adjusted */
+            h->param.i_keyint_max = x264_clip3( h->param.i_keyint_max, 1, X264_KEYINT_MAX_INFINITE );
+            h->param.i_bframe = x264_clip3( h->param.i_bframe, 0, (h->param.i_keyint_max - 1) / 2 );
+            h->param.i_keyint_max -= h->param.i_bframe;
+        }
         h->param.b_aud = 1;
         h->param.i_nal_hrd = X264_MAX( h->param.i_nal_hrd, X264_NAL_HRD_VBR );
         h->param.i_slice_max_size = 0;
@@ -964,6 +971,13 @@ static int x264_validate_parameters( x264_t *h, int b_open )
         h->param.analyse.i_weighted_pred = X264_MIN( h->param.analyse.i_weighted_pred, X264_WEIGHTP_SIMPLE );
         if( h->param.b_fake_interlaced )
             h->param.b_pic_struct = 1;
+    }
+
+    h->param.i_keyint_max = x264_clip3( h->param.i_keyint_max, 1, X264_KEYINT_MAX_INFINITE );
+    if( h->param.i_keyint_max == 1 )
+    {
+        h->param.b_intra_refresh = 0;
+        h->param.analyse.i_weighted_pred = 0;
     }
 
     h->param.i_frame_reference = x264_clip3( h->param.i_frame_reference, 1, X264_REF_MAX );
@@ -1250,10 +1264,12 @@ static int x264_validate_parameters( x264_t *h, int b_open )
         h->param.rc.f_qblur = 0;
     if( h->param.rc.f_complexity_blur < 0 )
         h->param.rc.f_complexity_blur = 0;
+    if( h->param.sc.i_buffer_size < 0 || h->param.sc.f_speed <= 0 )
+        h->param.sc.i_buffer_size = 0;
 
     h->param.i_sps_id &= 31;
 
-    h->param.i_nal_hrd = x264_clip3( h->param.i_nal_hrd, X264_NAL_HRD_NONE, X264_NAL_HRD_CBR );
+    h->param.i_nal_hrd = x264_clip3( h->param.i_nal_hrd, X264_NAL_HRD_NONE, X264_NAL_HRD_FAKE_CBR );
 
     if( h->param.i_nal_hrd && !h->param.rc.i_vbv_buffer_size )
     {
@@ -1261,13 +1277,14 @@ static int x264_validate_parameters( x264_t *h, int b_open )
         h->param.i_nal_hrd = X264_NAL_HRD_NONE;
     }
 
-    if( h->param.i_nal_hrd == X264_NAL_HRD_CBR &&
-       (h->param.rc.i_bitrate != h->param.rc.i_vbv_max_bitrate || !h->param.rc.i_vbv_max_bitrate) )
+     if( (h->param.i_nal_hrd == X264_NAL_HRD_CBR || h->param.i_nal_hrd == X264_NAL_HRD_FAKE_CBR) &&
+         (h->param.rc.i_bitrate != h->param.rc.i_vbv_max_bitrate || !h->param.rc.i_vbv_max_bitrate) )
     {
         x264_log( h, X264_LOG_WARNING, "CBR HRD requires constant bitrate\n" );
-        h->param.i_nal_hrd = X264_NAL_HRD_VBR;
+        h->param.i_nal_hrd = h->param.i_nal_hrd == X264_NAL_HRD_CBR ? X264_NAL_HRD_VBR : X264_NAL_HRD_FAKE_CBR;
     }
 
+    h->param.sc.max_preset = x264_clip3( h->param.sc.max_preset, 1, SC_PRESETS );
     if( h->param.i_nal_hrd == X264_NAL_HRD_CBR )
         h->param.rc.b_filler = 1;
 
@@ -1463,6 +1480,8 @@ x264_t *x264_encoder_open( x264_param_t *param )
     x264_set_aspect_ratio( h, &h->param, 1 );
 
     x264_sps_init( h->sps, h->param.i_sps_id, &h->param );
+    h->param.i_profile = h->sps->i_profile_idc;
+
     x264_pps_init( h->pps, h->param.i_sps_id, &h->param, h->sps );
 
     x264_validate_levels( h, 1 );
@@ -1550,6 +1569,10 @@ x264_t *x264_encoder_open( x264_param_t *param )
 
     mbcmp_init( h );
     chroma_dsp_init( h );
+
+    if( h->param.sc.i_buffer_size )
+        x264_speedcontrol_new( h );
+
 
     p = buf + sprintf( buf, "using cpu capabilities:" );
     for( int i = 0; x264_cpu_names[i].flags; i++ )
@@ -2529,7 +2552,7 @@ static inline void x264_slice_init( x264_t *h, int i_nal_type, int i_global_qp )
     if( h->sps->i_poc_type == 0 )
     {
         h->sh.i_poc = h->fdec->i_poc;
-        if( PARAM_INTERLACED )
+        if( PARAM_INTERLACED && h->pps->b_pic_order )
         {
             h->sh.i_delta_poc_bottom = h->param.b_tff ? 1 : -1;
             h->sh.i_poc += h->sh.i_delta_poc_bottom == -1;
@@ -3553,7 +3576,7 @@ int     x264_encoder_encode( x264_t *h,
         }
 
         /* when frame threading is used, buffering period sei is written in x264_encoder_frame_end */
-        if( h->i_thread_frames == 1 && h->sps->vui.b_nal_hrd_parameters_present )
+        if( h->i_thread_frames == 1 && h->param.i_nal_hrd )
         {
             x264_hrd_fullness( h );
             x264_nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
@@ -3641,6 +3664,10 @@ int     x264_encoder_encode( x264_t *h,
             return -1;
         overhead += h->out.nal[h->out.i_nal-1].i_payload + SEI_OVERHEAD;
     }
+
+    /* Init the speed control */
+    if( h->param.sc.i_buffer_size )
+        x264_speedcontrol_frame( h );
 
     if( h->fenc->b_keyframe && h->param.b_intra_refresh )
         h->i_cpb_delay_pir_offset_next = h->fenc->i_cpb_delay;
@@ -3757,7 +3784,7 @@ static int x264_encoder_frame_end( x264_t *h, x264_t *thread_current,
     x264_emms();
 
     /* generate buffering period sei and insert it into place */
-    if( h->i_thread_frames > 1 && h->fenc->b_keyframe && h->sps->vui.b_nal_hrd_parameters_present )
+    if( h->i_thread_frames > 1 && h->fenc->b_keyframe && h->param.i_nal_hrd )
     {
         x264_hrd_fullness( h );
         x264_nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
@@ -3781,7 +3808,6 @@ static int x264_encoder_frame_end( x264_t *h, x264_t *thread_current,
 
     /* Set output picture properties */
     pic_out->i_type = h->fenc->i_type;
-
     pic_out->b_keyframe = h->fenc->b_keyframe;
     pic_out->i_pic_struct = h->fenc->i_pic_struct;
 
@@ -3869,6 +3895,9 @@ static int x264_encoder_frame_end( x264_t *h, x264_t *thread_current,
         }
     }
 
+    if( h->fenc->b_keyframe && h->param.b_intra_refresh )
+        h->i_cpb_delay_pir_offset = h->fenc->i_cpb_delay;
+
     /* End bitstream, set output  */
     *pi_nal = h->out.i_nal;
     *pp_nal = h->out.nal;
@@ -3876,6 +3905,9 @@ static int x264_encoder_frame_end( x264_t *h, x264_t *thread_current,
     h->out.i_nal = 0;
 
     x264_noise_reduction_update( h );
+
+    if( h->param.sc.i_buffer_size )
+        x264_speedcontrol_frame_end( h );
 
     /* ---------------------- Compute/Print statistics --------------------- */
     x264_thread_sync_stat( h, h->thread[0] );
@@ -4329,6 +4361,7 @@ void    x264_encoder_close  ( x264_t *h )
 
     /* rc */
     x264_ratecontrol_delete( h );
+    x264_speedcontrol_delete( h );
 
     /* param */
     if( h->param.rc.psz_stat_out )
